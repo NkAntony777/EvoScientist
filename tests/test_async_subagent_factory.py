@@ -92,10 +92,15 @@ def test_factory_requests_async_safe_middleware(
 
     build_async_subagent_graph("writing-agent")
 
-    # The contract: factory MUST pass async-safe mode and the source agent name.
+    # The contract: factory MUST pass async-safe mode, the source agent name,
+    # and its backend — the backend is what makes the per-run
+    # SummarizationMiddleware subclass replace the frozen-window built-in in
+    # the deployed graph (#466).
     mock_get_mw.assert_called_once_with(
         for_async_subagent=True,
         memory_source_agent="writing-agent",
+        backend=mock_backend.return_value,
+        chat_model=mock_chat.return_value,
     )
     subagents = mock_create.call_args.kwargs["subagents"]
     assert subagents[0]["name"] == "general-purpose"
@@ -103,6 +108,50 @@ def test_factory_requests_async_safe_middleware(
         subagents[0],
         source_agent="general-purpose",
     )
+
+
+@patch("deepagents.create_deep_agent")
+@patch("EvoScientist.EvoScientist._load_mcp_tools_cached", return_value={})
+@patch("EvoScientist.EvoScientist._get_default_middleware", return_value=[])
+@patch("EvoScientist.EvoScientist._get_default_backend")
+@patch("EvoScientist.EvoScientist._ensure_chat_model")
+@patch("EvoScientist.utils.load_subagents")
+@patch("EvoScientist.config.apply_config_to_env")
+@patch("EvoScientist.config.get_effective_config")
+def test_factory_never_arms_hitl_interrupt_on(
+    mock_get_cfg,
+    mock_apply_env,
+    mock_load_subs,
+    mock_chat,
+    mock_backend,
+    mock_get_mw,
+    mock_mcp,
+    mock_create,
+):
+    """Async sub-agent graphs must NEVER pass ``interrupt_on``.
+
+    The main graph is always armed (``_build_hitl_interrupt_on``), but an armed
+    async sub-agent would hang on its first ``execute`` — the parent holds only
+    a ``task_id`` and cannot deliver approval. Pins the intentional asymmetry
+    documented in ``_factory.py`` so always-arm never leaks into the children.
+    """
+    cfg = MagicMock()
+    cfg.recursion_limit = 1_000_000
+    cfg.memory_profile_enabled = True
+    cfg.memory_observations_enabled = True
+    cfg.memory_observation_writer = MemoryObservationWriter.ALL
+    cfg.memory_workers_enabled = True
+    mock_get_cfg.return_value = cfg
+    mock_load_subs.return_value = [
+        {"name": "writing-agent", "system_prompt": "", "tools": [], "skills": None}
+    ]
+    mock_create.return_value.with_config.return_value = MagicMock()
+
+    from EvoScientist.subagents._factory import build_async_subagent_graph
+
+    build_async_subagent_graph("writing-agent")
+
+    assert "interrupt_on" not in mock_create.call_args.kwargs
 
 
 @patch("EvoScientist.EvoScientist._ensure_chat_model")
