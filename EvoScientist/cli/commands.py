@@ -1252,8 +1252,10 @@ def _serve_process_message(
                 timeout=30,
             )
 
-    def _hitl_prompt(action_requests: list) -> list[dict] | None:
-        return channel_hitl_prompt(action_requests, msg)
+    def _hitl_outcome(action_requests: list, human_budget_exhausted: bool):
+        return channel_hitl_prompt(
+            action_requests, msg, human_budget_exhausted=human_budget_exhausted
+        )
 
     def _ask_user_prompt(ask_user_data: dict) -> dict:
         return channel_ask_user_prompt(ask_user_data, msg)
@@ -1332,7 +1334,7 @@ def _serve_process_message(
                 on_thinking=_send_thinking,
                 on_todo=_send_todo,
                 on_file_write=_send_media,
-                hitl_prompt_fn=_hitl_prompt,
+                hitl_outcome_fn=_hitl_outcome,
                 ask_user_prompt_fn=_ask_user_prompt,
                 cancel_scope=_channel_message_cancel_scope(msg),
                 gateway=runtime_gateways.graph_gateway,
@@ -1416,7 +1418,7 @@ def _serve_drain_notifications(
         thread_id = runtime_state.thread_id
         if not thread_id:
             return {}
-        return await async_notifier.read_async_tasks_from_gateway(
+        registry = await async_notifier.read_async_tasks_from_gateway(
             runtime_state.runtime_gateways.graph_gateway,
             GraphTarget(
                 local_graph=runtime_state.agent,
@@ -1424,6 +1426,7 @@ def _serve_drain_notifications(
             ),
             thread_id,
         )
+        return registry or {}
 
     async def _consume() -> None:
         await async_notifier.consume_notifications(
@@ -1643,6 +1646,45 @@ def serve(
     _orig_sigint = signal.signal(signal.SIGINT, _handle_shutdown)
     _orig_sigterm = signal.signal(signal.SIGTERM, _handle_shutdown)
 
+    def _serve_reader_target() -> GraphTarget:
+        return GraphTarget(
+            local_graph=runtime_state.agent,
+            workspace_dir=runtime_state.workspace_dir,
+        )
+
+    async def _serve_enqueue_completions() -> None:
+        # On turn close, read async_tasks off thread state and enqueue any
+        # completions not yet surfaced; the idle drain below injects them.
+        thread_id = runtime_state.thread_id
+        if not thread_id:
+            return
+        await async_notifier.enqueue_completions_from_state(
+            runtime_state.runtime_gateways.graph_gateway,
+            _serve_reader_target(),
+            thread_id,
+        )
+        await async_notifier.enqueue_bg_process_completions_from_state(
+            runtime_state.runtime_gateways.graph_gateway,
+            _serve_reader_target(),
+            thread_id,
+        )
+
+    async def _serve_enqueue_completions_idle() -> None:
+        # Throttled idle-tick reader: surfaces async-task + bg-process completions
+        # while no channel message is being processed, without a state read on
+        # every poll tick.
+        thread_id = runtime_state.thread_id
+        if not thread_id:
+            return
+        gateway = runtime_state.runtime_gateways.graph_gateway
+        target = _serve_reader_target()
+        await async_notifier.enqueue_completions_from_state_throttled(
+            gateway, target, thread_id
+        )
+        await async_notifier.enqueue_bg_process_completions_from_state_throttled(
+            gateway, target, thread_id
+        )
+
     try:
         while not shutdown_event.is_set():
             try:
@@ -1670,8 +1712,11 @@ def serve(
                     break
                 finally:
                     active_cancel_scope = no_active_cancel_scope
+                runtime_state.async_runtime.run_sync(_serve_enqueue_completions)
 
-            # Poll notification queue when idle (no channel message was pending).
+            # Detect async-task completions from state (throttled) so they
+            # surface while idle, then poll the notification queue.
+            runtime_state.async_runtime.run_sync(_serve_enqueue_completions_idle)
             if async_notifier.has_pending_notifications(runtime_state.thread_id):
                 # Notification turns use the default stream cancellation scope.
                 active_cancel_scope = None
@@ -1685,6 +1730,11 @@ def serve(
                     )
                 finally:
                     active_cancel_scope = no_active_cancel_scope
+                # Re-arm the idle reader unconditionally after a notification
+                # turn too: it may have launched a chained task (analysis
+                # finished -> start writing) that would otherwise sit in state
+                # with the reader disarmed until an inbound channel message.
+                runtime_state.async_runtime.run_sync(_serve_enqueue_completions)
     except KeyboardInterrupt:
         shutdown_event.set()
     finally:

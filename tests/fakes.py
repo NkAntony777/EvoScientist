@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator, Callable, Iterable
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -302,6 +303,11 @@ class FakeGraphGateway(GraphGateway):
         state_error: BaseException | None = None,
         generated_thread_ids: Iterable[str] | None = None,
         thread_store: ThreadStore | None = None,
+        run_statuses: dict[str, str] | None = None,
+        run_status_error: BaseException | None = None,
+        process_statuses: dict[str, str] | None = None,
+        process_status_error: BaseException | None = None,
+        checkpoint: Any | None = None,
     ) -> None:
         self.events = list(events or [])
         self.stream = stream
@@ -309,11 +315,25 @@ class FakeGraphGateway(GraphGateway):
         self.state_error = state_error
         self.generated_thread_ids = list(generated_thread_ids or [])
         self.thread_store = thread_store or FakeThreadStore()
+        # run_id -> status, consulted by get_run_status; unknown ids read as
+        # the non-terminal "running" so the reader leaves them for a later poll.
+        self.run_statuses = run_statuses or {}
+        self.run_status_error = run_status_error
+        self.run_status_calls: list[tuple[str, str]] = []
+        # process_id -> status, consulted by get_process_status; unknown ids read
+        # as "running" so the reader leaves them for a later poll.
+        self.process_statuses = process_statuses or {}
+        self.process_status_error = process_status_error
+        self.process_status_calls: list[str] = []
+        self.checkpoint = checkpoint
         self.requests: list[RunRequest] = []
         self.clone_calls: list[
             tuple[str, dict[str, Any] | None, GraphTarget | None]
         ] = []
-        self.updated_states: list[tuple[GraphTarget, str, GraphStateValues]] = []
+        self.updated_states: list[
+            tuple[GraphTarget, str, GraphStateValues | None, str | None]
+        ] = []
+        self.update_error: BaseException | None = None
 
     async def create_thread(
         self,
@@ -407,15 +427,130 @@ class FakeGraphGateway(GraphGateway):
     ) -> GraphStateValues:
         if self.state_error is not None:
             raise self.state_error
+        if self.checkpoint is not None:
+            snapshot = await self.get_state_snapshot(target, thread_id)
+            values = getattr(snapshot, "values", None) or {}
+            return dict(values) if isinstance(values, dict) else {}
         return self.state_values
+
+    async def get_state_snapshot(
+        self,
+        target: GraphTarget,
+        thread_id: str,
+    ) -> Any:
+        if self.checkpoint is not None:
+            return await self.checkpoint.aget_state(
+                {"configurable": {"thread_id": thread_id}}
+            )
+        return SimpleNamespace(
+            next=(),
+            tasks=(),
+            interrupts=(),
+            values=self.state_values,
+        )
 
     async def update_state_values(
         self,
         target: GraphTarget,
         thread_id: str,
-        values: GraphStateValues,
+        values: GraphStateValues | None,
+        *,
+        as_node: str | None = None,
     ) -> None:
-        self.updated_states.append((target, thread_id, values))
+        if self.update_error is not None:
+            raise self.update_error
+        self.updated_states.append((target, thread_id, values, as_node))
+        if self.checkpoint is not None:
+            await self.checkpoint.aupdate_state(
+                {"configurable": {"thread_id": thread_id}},
+                values,
+                as_node=as_node,
+            )
+
+    async def get_run_status(
+        self,
+        target: GraphTarget,
+        thread_id: str,
+        run_id: str,
+    ) -> str:
+        self.run_status_calls.append((thread_id, run_id))
+        if self.run_status_error is not None:
+            raise self.run_status_error
+        return self.run_statuses.get(run_id, "running")
+
+    async def get_process_status(
+        self,
+        target: GraphTarget,
+        thread_id: str,
+        process_id: str,
+    ) -> str:
+        self.process_status_calls.append(process_id)
+        if self.process_status_error is not None:
+            raise self.process_status_error
+        return self.process_statuses.get(process_id, "running")
+
+
+class FakeCheckpointAgent:
+    """Compiled-graph stand-in for ``_recover_interrupted_graph_state``.
+
+    Models a HITL park: the first ``as_node="__end__"`` commits an optional
+    pending sibling write and schedules ``model``; a trailing ``__end__``
+    leaves ``next`` and ``tasks`` empty so recovery's verify can pass.
+    """
+
+    def __init__(
+        self,
+        *,
+        values: dict[str, Any] | None = None,
+        next: tuple[str, ...] = ("tools",),
+        pending_write: Any | None = None,
+        update_error: BaseException | None = None,
+    ) -> None:
+        self.values: dict[str, Any] = dict(values or {})
+        self.next: tuple[str, ...] = next
+        self.tasks: tuple[Any, ...] = (
+            (SimpleNamespace(name=next[0], interrupts=()),) if next else ()
+        )
+        self.interrupts: tuple[Any, ...] = (object(),) if next else ()
+        self.pending_write = pending_write
+        self.update_error = update_error
+        self.updates: list[tuple[Any, str | None]] = []
+
+    async def aget_state(self, _config: dict[str, Any]) -> SimpleNamespace:
+        return SimpleNamespace(
+            next=self.next,
+            tasks=self.tasks,
+            interrupts=self.interrupts,
+            values=self.values,
+        )
+
+    async def aupdate_state(
+        self,
+        _config: dict[str, Any],
+        values: dict[str, Any] | None,
+        as_node: str | None = None,
+    ) -> None:
+        if self.update_error is not None:
+            raise self.update_error
+        self.updates.append((values, as_node))
+        if as_node == "__end__":
+            if self.pending_write is not None:
+                messages = list(self.values.get("messages") or [])
+                messages.append(self.pending_write)
+                self.values = {**self.values, "messages": messages}
+                self.pending_write = None
+            if self.next and self.next != ("model",):
+                self.next = ("model",)
+                self.tasks = (SimpleNamespace(name="model", interrupts=()),)
+                self.interrupts = ()
+            else:
+                self.next = ()
+                self.tasks = ()
+                self.interrupts = ()
+        elif as_node == "tools" and isinstance(values, dict):
+            messages = list(self.values.get("messages") or [])
+            messages.extend(values.get("messages") or [])
+            self.values = {**self.values, "messages": messages}
 
 
 class FakeLangGraphRunModule:
@@ -512,6 +647,7 @@ class FakeLangGraphThreadsClient:
         self.metadata_updates: list[tuple[str, dict[str, Any]]] = []
         self.deleted: list[str] = []
         self.gets: list[str] = []
+        self.state_gets: list[str] = []
         self.searches: list[dict[str, Any]] = []
         self.stream_calls: list[tuple[str, str]] = []
         self.state_updates: list[tuple[str, GraphStateValues, str | None]] = []
@@ -609,6 +745,7 @@ class FakeLangGraphThreadsClient:
     async def get_state(self, thread_id: str) -> dict[str, Any]:
         from langgraph_sdk.errors import NotFoundError
 
+        self.state_gets.append(thread_id)
         if thread_id in self.states:
             return self.states[thread_id]
         raise NotFoundError("not found", response=_not_found_response(), body=None)

@@ -173,15 +173,20 @@ class LocalGraphGateway:
         finally:
             await inner.aclose()
 
+    async def get_state_snapshot(
+        self,
+        target: GraphTarget,
+        thread_id: str,
+    ) -> Any:
+        local_graph = self._require_local_graph(target)
+        return await local_graph.aget_state({"configurable": {"thread_id": thread_id}})
+
     async def get_state_values(
         self,
         target: GraphTarget,
         thread_id: str,
     ) -> GraphStateValues:
-        local_graph = self._require_local_graph(target)
-        snapshot = await local_graph.aget_state(
-            {"configurable": {"thread_id": thread_id}}
-        )
+        snapshot = await self.get_state_snapshot(target, thread_id)
         values: GraphStateValues = snapshot.values
         return values
 
@@ -189,15 +194,52 @@ class LocalGraphGateway:
         self,
         target: GraphTarget,
         thread_id: str,
-        values: GraphStateValues,
+        values: GraphStateValues | None,
+        *,
+        as_node: str | None = None,
     ) -> None:
         local_graph = self._require_local_graph(target)
-        as_node = "model" if "_summarization_event" in values else None
+        if (
+            as_node is None
+            and isinstance(values, dict)
+            and "_summarization_event" in values
+        ):
+            as_node = "model"
         await local_graph.aupdate_state(
             {"configurable": {"thread_id": thread_id}},
             values,
             as_node=as_node,
         )
+
+    async def get_run_status(
+        self,
+        target: GraphTarget,
+        thread_id: str,
+        run_id: str,
+    ) -> str:
+        # The main graph runs in-process, but async sub-agent tasks still run
+        # on the langgraph dev server (launching them requires it up), so their
+        # run status lives there — read it through the dev-server SDK client.
+        from ..langgraph_dev.sdk import (
+            cached_langgraph_async_client,
+            configured_langgraph_dev_url,
+        )
+
+        client = cached_langgraph_async_client(configured_langgraph_dev_url())
+        run = await client.runs.get(thread_id, run_id)
+        return run["status"]
+
+    async def get_process_status(
+        self,
+        target: GraphTarget,
+        thread_id: str,
+        process_id: str,
+    ) -> str:
+        # Background processes launched by the in-process main graph live in this
+        # process's registry, so read it directly (no server round-trip).
+        from .. import background
+
+        return background.poll_status(process_id)
 
     def _require_local_graph(self, target: GraphTarget | None) -> CompiledStateGraph:
         if target is None or target.local_graph is None:

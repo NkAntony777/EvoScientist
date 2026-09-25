@@ -360,6 +360,71 @@ class ActionVerdict:
     reason: str = ""
 
 
+# Per-run ``configurable`` key that disarms HITL and hands the dangerous-command
+# gate to the backend. Set client-side by ``resolve_per_run_config`` from
+# ``hitl_suppressed_for_run`` (``auto_mode`` or ``auto_approve``) and written on
+# every gateway run; read by the HITL ``when`` predicate and the backend/background
+# guards. A per-run channel (not a construction flag) so a keepalive server can
+# disarm one run without disarming the armed graph.
+HITL_SUPPRESSED_KEY = "hitl_suppressed"
+
+
+def is_hitl_suppressed(config=None) -> bool:
+    """Whether the current run has HITL suppressed via ``configurable``.
+
+    Reads :data:`HITL_SUPPRESSED_KEY` off an explicit *config* (the run's
+    ``RunnableConfig`` dict) or, when omitted, the ambient
+    ``langgraph.config.get_config()``. The key is written only by the two
+    Python gateways; a run that reached langgraph dev directly (WebUI,
+    ``EvoSci deploy`` SDK clients, LangSmith Studio) never carries it, so when
+    it is absent we fall back to the serving process's ``auto_approve`` — this
+    restores the base behaviour for those clients (a file/env ``auto_approve``
+    deployment runs unattended instead of parking on an interrupt nothing
+    answers), while gateway-driven runs, which always set the key, are
+    unaffected. Returns ``False`` outside a runnable context (direct calls
+    without a config, tests) — the safe floor: armed graph, no backend guard.
+    """
+    if config is None:
+        try:
+            from langgraph.config import get_config
+
+            config = get_config()
+        except Exception:
+            return False
+    if not isinstance(config, dict):
+        return False
+    configurable = config.get("configurable") or {}
+    if not isinstance(configurable, dict):
+        return False
+    if HITL_SUPPRESSED_KEY not in configurable:
+        from .EvoScientist import _ensure_config
+
+        return bool(_ensure_config().auto_approve)
+    return bool(configurable[HITL_SUPPRESSED_KEY])
+
+
+def hitl_suppressed_for_run(config=None) -> bool:
+    """Whether THIS run must disarm HITL and fall back to the backend guard.
+
+    The pre-run derivation of the suppression flag: both gateway backends
+    call it when assembling a run's config and feed the result into
+    ``gateway.types.resolve_per_run_config(hitl_suppressed=...)``. True for
+    ``auto_mode`` (unattended) OR ``auto_approve`` (attended, prompts opted
+    out): both run against the always-armed graph with the interrupt disarmed
+    and the backend guarding the dangerous set — what those users get on main
+    today, and it keeps the always-armed auto-resume off the recursion limit
+    (#469). *config* defaults to the live session config (``_ensure_config`` —
+    cached, in-place-mutated), so unsaved mid-session toggles still apply.
+    """
+    if config is None:
+        from .EvoScientist import _ensure_config
+
+        config = _ensure_config()
+    return bool(
+        getattr(config, "auto_mode", False) or getattr(config, "auto_approve", False)
+    )
+
+
 def resolve_action_decision(
     command: str,
     *,
@@ -409,6 +474,100 @@ def resolve_action_decision(
                 return ActionVerdict(ActionDecision.APPROVE)
 
     return ActionVerdict(ActionDecision.PROMPT)
+
+
+# Reason recorded on tool results written when a HITL round budget closes a
+# parked interrupt without resuming the agent (issue #469). A rejecting
+# ``Command(resume=...)`` does not close the checkpoint: HumanInTheLoop
+# middleware turns it into a ToolMessage and routes straight back to the
+# model. Surfaces call ``_recover_interrupted_graph_state(close_interrupts=
+# True)`` so the clear → patch → clear → verify sequence is shared with
+# crash recovery. The constant is part of the HITL result text, alongside
+# the stock "do not retry" sentence — passing it as a reject decision's
+# ``message`` would drop that sentence.
+HITL_ROUND_LIMIT_REJECT_MESSAGE = "approval round limit reached"
+
+
+def abandoned_tool_messages(messages: list) -> list:
+    """Tool results for unanswered calls on the last AI message.
+
+    Closing a parked interrupt without these leaves dangling ``tool_calls``
+    or ``invalid_tool_calls``, and the next user turn is rejected by the
+    provider. The wording keeps the middleware's default "do not retry"
+    instruction. Crash recovery covers both lists; this does too.
+    """
+    from langchain_core.messages import AIMessage, ToolMessage, convert_to_messages
+
+    try:
+        converted = list(convert_to_messages(messages))
+    except Exception:
+        return []
+
+    def _calls(message: AIMessage) -> list:
+        return [
+            *message.tool_calls,
+            *(getattr(message, "invalid_tool_calls", None) or ()),
+        ]
+
+    last_ai = None
+    last_index = -1
+    for index, message in enumerate(converted):
+        if isinstance(message, AIMessage) and _calls(message):
+            last_ai = message
+            last_index = index
+    if last_ai is None:
+        return []
+    answered = {
+        message.tool_call_id
+        for message in converted[last_index + 1 :]
+        if getattr(message, "type", None) == "tool" and message.tool_call_id
+    }
+    results = []
+    for call in _calls(last_ai):
+        call_id = call.get("id")
+        if not call_id or call_id in answered:
+            continue
+        name = call.get("name") or "tool"
+        results.append(
+            ToolMessage(
+                content=(
+                    f"User rejected the tool call for `{name}` with id {call_id} "
+                    f"({HITL_ROUND_LIMIT_REJECT_MESSAGE}). The tool was not "
+                    "executed. Do not retry this tool call unless the user "
+                    "explicitly requests it."
+                ),
+                name=name,
+                tool_call_id=call_id,
+                status="error",
+            )
+        )
+    return results
+
+
+async def close_parked_checkpoint(gateway, target, thread_id: str) -> None:
+    """End a parked HITL/ask_user turn without another model step.
+
+    Reuses ``_recover_interrupted_graph_state(close_interrupts=True)`` through
+    ``gateway`` so HITL budget exhaustion and crash recovery share one
+    clear → patch → clear → verify sequence. After #470,
+    ``GraphTarget.local_graph`` may be None and execution is server-backed;
+    the gateway is the authority for checkpoint reads and writes.
+
+    Finished sibling writes (``ask_user`` beside another tool) stay in
+    history; unanswered calls get HITL reject results. A rejecting resume
+    is not used: that resumes the agent.
+    """
+    from .stream.events import _GatewayCheckpointOps, _recover_interrupted_graph_state
+
+    ok = await _recover_interrupted_graph_state(
+        _GatewayCheckpointOps(gateway, target, thread_id),
+        {"configurable": {"thread_id": thread_id}},
+        close_interrupts=True,
+    )
+    if not ok:
+        raise RuntimeError(
+            f"Could not close parked HITL checkpoint on thread {thread_id}"
+        )
 
 
 def build_hitl_resume(interrupt_id: str, decisions: list[dict]) -> "Command":
@@ -1627,12 +1786,26 @@ class CustomSandboxBackend(LocalShellBackend):
             self.cwd,
             virtual_mode=self.virtual_mode,
             dangerous=self._dangerous,
-            guard_dangerous=self._guard_dangerous,
+            guard_dangerous=self._effective_guard_dangerous(),
         )
         if error:
             return ExecuteResponse(output=error, exit_code=1, truncated=False)
 
         return self._execute_prepared_command(command, timeout=timeout)
+
+    def _effective_guard_dangerous(self) -> bool:
+        """Guard the dangerous-command set for this call.
+
+        The construction flag stays a floor (``True`` for guarded async
+        sub-agents, which have no approval path at all). On top of it, a run
+        with HITL suppressed (``auto_mode`` or attended ``auto_approve``) is
+        guarded per call: the interrupt is disarmed there, so the backend is
+        the only gate. A plain attended run (no auto_mode/auto_approve) is NOT
+        guarded here — the HITL interrupt plus the client policy decide, so the
+        flag is not baked at construction and a mid-session flip can never
+        leave it stale.
+        """
+        return self._guard_dangerous or is_hitl_suppressed()
 
     def _execute_prepared_command(
         self,
